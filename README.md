@@ -21,11 +21,14 @@ Celery + Redis · Paystack (deposits, refunds, Transfers payouts)
 ```sh
 py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-copy .env.example .env   # fill in DB + Paystack credentials
-createdb book
+copy .env.example .env   # fill in DATABASE_URL + Paystack credentials
 .venv\Scripts\python.exe manage.py migrate
 .venv\Scripts\python.exe -m pytest
 ```
+
+Note: your database user needs the `CREATEDB` privilege so pytest can
+create its throwaway test database (grant once as a superuser:
+`ALTER ROLE your_user CREATEDB;`). CI's postgres user already has it.
 
 CI (`.github/workflows/ci.yml`) runs the same suite against a real
 PostgreSQL 16 service.
