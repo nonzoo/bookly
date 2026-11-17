@@ -26,11 +26,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      DB_NAME: book_ci
-      DB_USER: postgres
-      DB_PASSWORD: postgres
-      DB_HOST: localhost
-      DB_PORT: 5432
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/book_ci
       DJANGO_SECRET_KEY: ci-not-secret
       PAYSTACK_SECRET_KEY: sk_test_ci
     steps:

@@ -1,15 +1,11 @@
-"""
-Process-level configuration. No domain logic lives here.
-
-Everything that differs between environments (local dev, CI, production)
-is read from environment variables with dev-friendly defaults, so the
-same code runs everywhere: CI in GitHub Actions sets the same variables
-a production deploy would.
-"""
 import os
 from pathlib import Path
+import dj_database_url
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-insecure-key")
 
@@ -18,7 +14,7 @@ def _load_dotenv():
     """Minimal .env loader (no python-dotenv dependency).
 
     Values never override variables already in the environment, so CI
-    and production config always wins over a stray local .env.
+    and production config always wins over a stray local .env. 
     """
     path = BASE_DIR / ".env"
     if not path.exists():
@@ -81,16 +77,6 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.environ.get("DB_NAME", "book"),
-        "USER": os.environ.get("DB_USER", "postgres"),
-        "PASSWORD": os.environ.get("DB_PASSWORD", "postgres"),
-        "HOST": os.environ.get("DB_HOST", "localhost"),
-        "PORT": os.environ.get("DB_PORT", "5432"),
-    }
-}
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
