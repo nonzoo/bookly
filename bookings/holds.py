@@ -27,6 +27,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from . import availability, money, payments
+from .constraints import is_exclusion_violation
 from .models import Booking, ClassSession, Payment
 from .paystack import PaystackError
 
@@ -161,7 +162,7 @@ def _create_exclusive_hold(*, service, customer, start_at, resource_id, party_si
             booking.save()
             payment = payments.build_deposit_payment(booking) if deposit > 0 else None
     except IntegrityError as exc:
-        if _is_exclusion_violation(exc):
+        if is_exclusion_violation(exc):
             raise SlotTaken("That slot was just taken. Pick another time.") from exc
         raise
 
@@ -274,7 +275,7 @@ def _create_group_hold(*, service, customer, session_id, party_size, address, no
             booking.save()
             payment = payments.build_deposit_payment(booking) if deposit > 0 else None
     except IntegrityError as exc:
-        if _is_exclusion_violation(exc):
+        if is_exclusion_violation(exc):
             # Group bookings are non-exclusive, so this only fires if a
             # blocker row was inserted concurrently — same customer-facing
             # outcome either way.
@@ -310,16 +311,4 @@ def _abandon(booking, payment):
             ClassSession.release_seats(booking.session_id, booking.party_size)
 
 
-# --------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------
 
-def _is_exclusion_violation(exc):
-    """True only for the no_overlapping_active_bookings constraint.
-
-    Any other IntegrityError must surface untouched — swallowing them
-    would hide real bugs behind a friendly 'slot taken'.
-    """
-    cause = exc.__cause__
-    diag = getattr(cause, "diag", None)
-    return bool(diag and getattr(diag, "constraint_name", None) == "no_overlapping_active_bookings")
