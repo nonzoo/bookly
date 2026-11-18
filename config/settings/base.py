@@ -127,3 +127,12 @@ PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET", "")
 CELERY_BROKER_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 # Eager mode runs tasks inline without a broker — how the test suite runs.
 CELERY_TASK_ALWAYS_EAGER = os.environ.get("CELERY_TASK_ALWAYS_EAGER", "") == "1"
+
+# Beat schedule. The per-resource sweep inside create_hold only clears the
+# slot being booked; this tick clears lapsed holds everywhere.
+CELERY_BEAT_SCHEDULE = {
+    "expire-overdue-holds": {
+        "task": "bookings.tasks.expire_overdue_holds",
+        "schedule": 60.0,  # seconds
+    },
+}

@@ -1,11 +1,9 @@
 """Celery bootstrap.
 
 Standard Django+Celery wiring: read settings with the CELERY_ prefix,
-autodiscover tasks in installed apps. The Celery *beat* schedule for the
-expiry sweep is added together with the task it schedules (bookings/tasks,
-lifecycle step) — a beat schedule referencing a task that doesn't exist
-yet would crash the beat process on startup, so a schedule never ships
-ahead of its task.
+autodiscover tasks in installed apps. The beat schedule lives next to the
+settings it uses (CELERY_BEAT_SCHEDULE in config/settings/base.py) and
+points at bookings.tasks.expire_overdue_holds.
 """
 import os
 
