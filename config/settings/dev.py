@@ -8,6 +8,5 @@ DATABASES = {
         # before anyone has copied .env.example.
         default="postgres://postgres:postgres@localhost:5432/book",
         conn_max_age=600,        # reuse connections for 10 minutes
-        conn_health_checks=True,
     )
 }

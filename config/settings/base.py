@@ -10,24 +10,6 @@ BASE_DIR = Path(__file__).resolve().parents[2]  # repo root (this file sits in c
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-insecure-key")
 
 
-def _load_dotenv():
-    """Minimal .env loader (no python-dotenv dependency).
-
-    Values never override variables already in the environment, so CI
-    and production config always wins over a stray local .env. 
-    """
-    path = BASE_DIR / ".env"
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
-
-
-_load_dotenv()
 
 # 1 in dev; CI and production set DJANGO_DEBUG=0
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
