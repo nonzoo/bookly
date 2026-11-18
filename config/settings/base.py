@@ -119,6 +119,9 @@ REST_FRAMEWORK = {
 
 # Paystack. The secret key never gets committed; the webhook flow reads it.
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
+# New timestamped `Paystack-Signature` scheme (whsec_...). Optional: when
+# absent, the legacy x-paystack-signature scheme (secret key) is used.
+PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET", "")
 
 # Celery (config/celery.py reads settings with the CELERY_ prefix).
 CELERY_BROKER_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")

@@ -1,8 +1,8 @@
-"""API routes for the bookings app.
+"""API routes for the bookings app."""
+from django.urls import path
 
-Empty for now: routes are added together with the views that call the
-service layer (holds, webhooks, lifecycle), so no URL ever exists without
-the logic behind it.
-"""
+from . import views
 
-urlpatterns = []
+urlpatterns = [
+    path("webhooks/paystack/", views.paystack_webhook, name="paystack-webhook"),
+]
