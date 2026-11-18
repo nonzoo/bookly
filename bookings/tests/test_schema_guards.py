@@ -20,6 +20,14 @@ def _constraint_exists(name, contype):
         return cursor.fetchone() is not None
 
 
+def _index_exists(name):
+    """For conditional UniqueConstraints: Django emits a partial unique
+    index, which lives in pg_indexes, not pg_constraint."""
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", [name])
+        return cursor.fetchone() is not None
+
+
 def test_btree_gist_extension_installed():
     with connection.cursor() as cursor:
         cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'btree_gist'")
@@ -40,4 +48,5 @@ def test_webhook_dedup_unique_constraint():
 
 
 def test_ledger_idempotency_constraint():
-    assert _constraint_exists("uniq_ledger_entry_per_payment_type", "u")
+    # Conditional UniqueConstraint -> partial unique index.
+    assert _index_exists("uniq_ledger_entry_per_payment_type")

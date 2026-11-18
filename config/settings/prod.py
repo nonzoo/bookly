@@ -1,6 +1,8 @@
 # Production settings.
 # DATABASE_URL MUST be provided by the environment — there is no fallback
 # here on purpose: a prod boot with a missing database URL must fail loudly.
+import dj_database_url
+
 from .base import *
 
 DATABASES = {

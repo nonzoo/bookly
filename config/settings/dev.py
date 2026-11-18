@@ -1,4 +1,6 @@
 """Local development settings: base plus a local DATABASE_URL fallback."""
+import dj_database_url
+
 from .base import *
 
 DATABASES = {
