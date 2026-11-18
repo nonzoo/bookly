@@ -15,6 +15,7 @@ Idempotency: every refund carries our unique reference. Paystack rejects a
 reused reference with 409, and create_refund() fetches the existing refund
 instead, so retries after a timeout are safe.
 """
+import logging
 import uuid
 
 from django.db import transaction
@@ -23,6 +24,8 @@ from django.utils import timezone
 from . import ledger, paystack
 from .models import Booking, Payment
 from .paystack import PaystackError
+
+logger = logging.getLogger(__name__)
 
 
 class RefundError(Exception):
@@ -65,6 +68,26 @@ def build_refund_payment(booking, *, amount_kobo=None) -> Payment:
         amount_kobo=amount,
         status=Payment.Status.INITIATED,
     )
+
+
+def queue_refund(booking) -> Payment:
+    """Create the refund row now, send it after the current transaction commits.
+
+    The webhook/lifecycle transaction must not wait on a remote API while
+    holding the booking lock. If sending fails, the row stays INITIATED and
+    a retry/reconciliation run can pick it up.
+    """
+    refund = build_refund_payment(booking)
+    refund_id = refund.pk
+    transaction.on_commit(lambda: send_refund_safely(refund_id))
+    return refund
+
+
+def send_refund_safely(refund_payment_id):
+    try:
+        send_refund(refund_payment_id)
+    except RefundError:
+        logger.exception("Refund %s could not be sent; left for retry", refund_payment_id)
 
 
 def send_refund(refund_payment_id) -> Payment:

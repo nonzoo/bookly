@@ -267,6 +267,13 @@ def _lock_deposit(reference):
     if snapshot is None:
         raise RetryableWebhookError(f"No deposit payment for reference {reference}.")
 
+    # Session first for group bookings: lifecycle's cancel_session holds
+    # the session lock while cancelling its bookings, and both must use
+    # the same order or the two paths can deadlock.
+    session_id = Booking.objects.values_list("session_id", flat=True).get(pk=snapshot["booking_id"])
+    if session_id is not None:
+        ClassSession.objects.select_for_update().get(pk=session_id)
+
     booking = Booking.objects.select_for_update().get(pk=snapshot["booking_id"])
     payment = Payment.objects.select_for_update().get(pk=snapshot["id"])
     return booking, payment
@@ -325,19 +332,9 @@ def _restore_expired(booking) -> bool:
 def _queue_refund(booking):
     """Create the refund row and send it after the webhook transaction commits."""
     try:
-        refund = refunds.build_refund_payment(booking)
+        refunds.queue_refund(booking)
     except refunds.RefundError as exc:
         raise PermanentWebhookError(f"Refund could not be created: {exc}") from exc
-
-    refund_id = refund.pk
-    transaction.on_commit(lambda: _send_refund_safely(refund_id))
-
-
-def _send_refund_safely(refund_id):
-    try:
-        refunds.send_refund(refund_id)
-    except refunds.RefundError:
-        logger.exception("Refund %s could not be sent; left for retry", refund_id)
 
 
 # --------------------------------------------------------------------------
