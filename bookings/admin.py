@@ -3,6 +3,7 @@ for the dashboard stretch item, and as the fastest debugging tool while
 the service layer is being built."""
 from django.contrib import admin
 
+from . import lifecycle
 from .models import (
     Booking,
     Business,
@@ -48,7 +49,25 @@ class TimeOffAdmin(admin.ModelAdmin):
 @admin.register(ClassSession)
 class ClassSessionAdmin(admin.ModelAdmin):
     list_display = ("service", "resource", "start_at", "capacity", "seats_taken", "is_cancelled")
-    list_filter = ("service",)
+    list_filter = ("service", "is_cancelled")
+    # Both fields are owned by the service layer: seats move only through
+    # reserve/release, and cancellation must also release seats, cancel
+    # customer bookings and refund deposits.
+    readonly_fields = ("seats_taken", "is_cancelled")
+    actions = ["cancel_sessions"]
+
+    @admin.action(description="Cancel sessions (release seats, refund deposits)")
+    def cancel_sessions(self, request, queryset):
+        cancelled = 0
+        for session in queryset:
+            # lifecycle.cancel_session re-locks the row, so a session
+            # cancelled concurrently is simply skipped here.
+            if lifecycle.cancel_session(session):
+                cancelled += 1
+        self.message_user(
+            request,
+            f"Cancelled {cancelled} session(s); already-cancelled sessions were skipped.",
+        )
 
 
 @admin.register(Booking)

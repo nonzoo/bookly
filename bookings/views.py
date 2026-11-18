@@ -1,26 +1,45 @@
-"""HTTP surface for the bookings app.
+"""Paystack webhook endpoint — function-based DRF view.
 
-Only the webhook is exposed so far. It is deliberately a plain Django
-view: the endpoint is unauthenticated (Paystack cannot hold a JWT) and
-DRF's default IsAuthenticated permission must not apply. The service
-layer does the real work; the view only translates HTTP to/from it.
+DRF is used here for two reasons:
+
+1. Throttling. The route is unauthenticated by definition, so JWT and
+   IsAuthenticated are switched off explicitly and an IP-scoped rate limit
+   is applied instead (the same settings-driven machinery as the rest of
+   the API).
+2. One HTTP translation layer. The view turns `InvalidWebhook` and the
+   service result into status codes; everything else is webhooks.receive.
+
+The signature is computed over the EXACT bytes Paystack signed, so the
+view reads `request.body` on the underlying HttpRequest. DRF's parsed
+`.data` would consume the stream — the body is never touched as data.
 """
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST
+from rest_framework import status
+from rest_framework.decorators import (
+    api_view,
+    authentication_classes,
+    permission_classes,
+    throttle_classes,
+)
+from rest_framework.response import Response
 
 from . import webhooks
+from .throttles import WebhookThrottle
 
 
-@csrf_exempt
-@require_POST
+@api_view(["POST"])
+@authentication_classes([])   # Paystack has no JWT
+@permission_classes([])       # ... and no Django user
+@throttle_classes([WebhookThrottle])  # 300/min per IP, from settings
 def paystack_webhook(request):
     try:
         result = webhooks.receive(request.body, request.headers)
     except webhooks.InvalidWebhook as exc:
-        return JsonResponse({"status": "error", "message": str(exc)}, status=400)
+        return Response(
+            {"status": "error", "message": str(exc)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
-    return JsonResponse(
+    return Response(
         {"status": "ok" if result.http_status == 200 else "error"},
         status=result.http_status,
     )
