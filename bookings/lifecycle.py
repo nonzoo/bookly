@@ -52,7 +52,7 @@ def cancel_by_customer(booking) -> CancellationResult:
         _require_status(booking, (Booking.Status.PENDING_PAYMENT, Booking.Status.CONFIRMED))
 
         now = timezone.now()
-        deadline = booking.start_at - timedelta(hours=booking.business.free_cancellation_hours)
+        deadline = booking.start_at - timedelta(hours=booking.free_cancellation_hours)
         free = now <= deadline
         # An unpaid hold can always be abandoned; if a charge somehow
         # already succeeded, the money goes back regardless of notice.

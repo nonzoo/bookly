@@ -114,6 +114,7 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "booking_create": "10/min",  # a customer hammering the hold endpoint
         "webhook": "300/min",        # loose IP cap on the unauthenticated route
+        "payment_verify": "30/min",  # return-page polling, backed by a provider call
     },
 }
 
@@ -122,6 +123,10 @@ PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
 # New timestamped `Paystack-Signature` scheme (whsec_...). Optional: when
 # absent, the legacy x-paystack-signature scheme (secret key) is used.
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET", "")
+# Where Paystack sends the customer after payment (the frontend's return
+# page). Paystack appends ?trxref=...&reference=... to it. Empty = let
+# Paystack show its own page; the webhook still settles the booking.
+PAYSTACK_CALLBACK_URL = os.environ.get("PAYSTACK_CALLBACK_URL", "")
 
 # Celery (config/celery.py reads settings with the CELERY_ prefix).
 CELERY_BROKER_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -134,5 +139,18 @@ CELERY_BEAT_SCHEDULE = {
     "expire-overdue-holds": {
         "task": "bookings.tasks.expire_overdue_holds",
         "schedule": 60.0,  # seconds
+    },
+    # Catch charges Paystack confirmed while the webhook was delayed or
+    # dropped. Runs before the 15-minute hold deadline so a paid customer
+    # keeps the slot instead of being refunded after it lapses.
+    "reconcile-pending-payments": {
+        "task": "bookings.tasks.reconcile_pending_payments",
+        "schedule": 300.0,
+    },
+    # A refund whose on-commit send failed stays INITIATED forever
+    # otherwise. create_refund is idempotent by reference.
+    "retry-stuck-refunds": {
+        "task": "bookings.tasks.retry_stuck_refunds",
+        "schedule": 900.0,
     },
 }

@@ -10,14 +10,16 @@ Throttle tests replace the rates rather than firing 11 real requests, and
 clear Django's cache so history never leaks between tests.
 """
 from datetime import datetime, time, timedelta
+import uuid
 from zoneinfo import ZoneInfo
 
 import pytest
 from django.core.cache import cache
+from django.test import override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient
 
-from bookings import holds, lifecycle, sessions
+from bookings import holds, lifecycle, paystack, sessions
 from bookings.models import Booking, ClassSession, Payment
 from bookings.tests.factories import (
     future_weekday,
@@ -111,13 +113,45 @@ def create_payload(service, day, hour=10, **overrides):
 def test_endpoints_require_authentication(service, day):
     client = APIClient()
     assert client.get(reverse("booking-list-create")).status_code == 401
-    assert (
-        client.get(
-            reverse("service-availability", args=[service.pk]), {"date": day.isoformat()}
-        ).status_code
-        == 401
-    )
     assert client.post(reverse("booking-list-create"), create_payload(service, day)).status_code == 401
+    assert client.get(reverse("booking-detail", args=[uuid.uuid4()])).status_code == 401
+    assert client.post(reverse("payment-verify"), {"reference": "x"}).status_code == 401
+
+
+def test_catalog_and_availability_are_readable_without_an_account(service, day):
+    """Discovery is public; only creating and reading a booking needs auth."""
+    client = APIClient()
+
+    availability = client.get(
+        reverse("service-availability", args=[service.pk]), {"date": day.isoformat()}
+    )
+    assert availability.status_code == 200
+
+    catalog = client.get(reverse("business-detail", args=[service.business.slug]))
+    assert catalog.status_code == 200
+
+
+def test_storefront_exposes_branding_policy_and_active_services(business, resource, service):
+    business.description = "Braids, cuts and colour in Lekki."
+    business.phone = "+2348000000000"
+    business.logo_url = "https://cdn.example.com/logo.png"
+    business.brand_color = "#123456"
+    business.save()
+    make_service(business, [resource], name="Aardvark (retired)", is_active=False)
+
+    response = APIClient().get(reverse("business-detail", args=[business.slug]))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == business.name
+    assert body["brand_color"] == "#123456"
+    assert body["free_cancellation_hours"] == 24
+    assert body["hold_minutes"] == 15
+    assert [item["name"] for item in body["services"]] == ["Service"]
+    assert body["services"][0]["deposit_kobo"] == 100_000  # 20% of ₦5,000
+    assert body["services"][0]["resources"][0]["name"] == "Ada"
+
+    assert APIClient().get(reverse("business-detail", args=["no-such-shop"])).status_code == 404
 
 
 def test_availability_returns_grid_slots(client_for, service, day):
@@ -275,6 +309,171 @@ def test_cancelling_a_terminal_booking_is_a_conflict(client_for, customer, servi
     response = client_for.post(reverse("booking-cancel", args=[held.booking.pk]))
 
     assert response.status_code == 409
+
+
+def test_booking_detail_is_owner_only(client_for, customer, service, day):
+    mine = holds.create_hold(service=service, customer=customer, start_at=dt(day, 10))
+    other = holds.create_hold(service=service, customer=make_user(), start_at=dt(day, 11))
+
+    response = client_for.get(reverse("booking-detail", args=[mine.booking.pk]))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == str(mine.booking.pk)
+    assert body["free_cancellation_hours"] == 24
+    assert body["business_slug"] == mine.booking.business.slug
+
+    # Someone else's id is indistinguishable from an id that does not exist.
+    assert client_for.get(reverse("booking-detail", args=[other.booking.pk])).status_code == 404
+
+
+@pytest.fixture
+def provider_verify(monkeypatch):
+    """Patch Paystack's verify call. Set .response or .error per test."""
+    calls = []
+
+    def fake_verify(reference, timeout=10):
+        calls.append(reference)
+        if fake_verify.error is not None:
+            raise fake_verify.error
+        return fake_verify.response
+
+    fake_verify.calls = calls
+    fake_verify.response = {"status": "pending"}
+    fake_verify.error = None
+    monkeypatch.setattr("bookings.paystack.verify_transaction", fake_verify)
+    return fake_verify
+
+
+def test_verify_applies_a_successful_charge(client_for, customer, service, day, provider_verify):
+    held = holds.create_hold(service=service, customer=customer, start_at=dt(day, 10))
+    provider_verify.response = {"status": "success", "amount": held.payment.amount_kobo}
+
+    response = client_for.post(
+        reverse("payment-verify"), {"reference": held.payment.reference}, format="json"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["payment"]["status"] == Payment.Status.SUCCESS
+    assert body["booking"]["status"] == Booking.Status.CONFIRMED
+
+    held.booking.refresh_from_db()
+    held.payment.refresh_from_db()
+    assert held.booking.status == Booking.Status.CONFIRMED
+    assert held.payment.status == Payment.Status.SUCCESS
+    assert provider_verify.calls == [held.payment.reference]
+
+
+def test_verify_is_idempotent_and_stops_calling_the_provider(
+    client_for, customer, service, day, provider_verify
+):
+    held = holds.create_hold(service=service, customer=customer, start_at=dt(day, 10))
+    provider_verify.response = {"status": "success", "amount": held.payment.amount_kobo}
+    payload = {"reference": held.payment.reference}
+
+    first = client_for.post(reverse("payment-verify"), payload, format="json")
+    second = client_for.post(reverse("payment-verify"), payload, format="json")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["payment"]["status"] == Payment.Status.SUCCESS
+    # A settled payment is answered from the database, not from Paystack.
+    assert provider_verify.calls == [held.payment.reference]
+
+
+def test_verify_restores_an_expired_hold_while_the_slot_is_free(
+    client_for, customer, service, day, provider_verify
+):
+    held = holds.create_hold(service=service, customer=customer, start_at=dt(day, 10))
+    # Expiry freed the slot: the exclusion constraint only covers active rows.
+    Booking.objects.filter(pk=held.booking.pk).update(
+        status=Booking.Status.EXPIRED, expires_at=None
+    )
+    provider_verify.response = {"status": "success", "amount": held.payment.amount_kobo}
+
+    response = client_for.post(
+        reverse("payment-verify"), {"reference": held.payment.reference}, format="json"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["booking"]["status"] == Booking.Status.CONFIRMED
+
+
+def test_verify_rejects_an_amount_that_differs_from_the_charge(
+    client_for, customer, service, day, provider_verify
+):
+    held = holds.create_hold(service=service, customer=customer, start_at=dt(day, 10))
+    provider_verify.response = {
+        "status": "success",
+        "amount": held.payment.amount_kobo + 1,
+    }
+
+    response = client_for.post(
+        reverse("payment-verify"), {"reference": held.payment.reference}, format="json"
+    )
+
+    assert response.status_code == 409
+    assert "amount mismatch" in response.json()["detail"].lower()
+    held.booking.refresh_from_db()
+    held.payment.refresh_from_db()
+    assert held.payment.status == Payment.Status.INITIATED
+    assert held.booking.status == Booking.Status.PENDING_PAYMENT
+
+
+def test_verify_cannot_touch_someone_elses_payment(client_for, service, day, provider_verify):
+    other = holds.create_hold(service=service, customer=make_user(), start_at=dt(day, 10))
+
+    response = client_for.post(
+        reverse("payment-verify"), {"reference": other.payment.reference}, format="json"
+    )
+
+    assert response.status_code == 404
+    assert provider_verify.calls == []
+    other.payment.refresh_from_db()
+    assert other.payment.status == Payment.Status.INITIATED
+
+
+def test_verify_reports_a_provider_outage_as_bad_gateway(
+    client_for, customer, service, day, provider_verify
+):
+    held = holds.create_hold(service=service, customer=customer, start_at=dt(day, 10))
+    provider_verify.error = paystack.PaystackError("provider down")
+
+    response = client_for.post(
+        reverse("payment-verify"), {"reference": held.payment.reference}, format="json"
+    )
+
+    assert response.status_code == 502
+
+
+def test_verify_requires_a_reference(client_for, provider_verify):
+    response = client_for.post(reverse("payment-verify"), {}, format="json")
+
+    assert response.status_code == 400
+    assert provider_verify.calls == []
+
+
+@override_settings(PAYSTACK_CALLBACK_URL="https://app.example.com/pay/return")
+def test_deposit_initialization_forwards_the_callback_url(
+    client_for, service, day, monkeypatch
+):
+    captured = {}
+
+    def fake_initialize(**kwargs):
+        captured.update(kwargs)
+        return {
+            "authorization_url": f"https://paystack.test/{kwargs['reference']}",
+            "reference": kwargs["reference"],
+        }
+
+    monkeypatch.setattr("bookings.paystack.initialize_transaction", fake_initialize)
+
+    response = client_for.post(reverse("booking-list-create"), create_payload(service, day))
+
+    assert response.status_code == 201
+    assert captured["callback_url"] == "https://app.example.com/pay/return"
+    assert captured["metadata"]["booking_id"] == response.json()["booking"]["id"]
 
 
 @pytest.fixture

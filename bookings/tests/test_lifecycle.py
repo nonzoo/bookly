@@ -71,7 +71,13 @@ def customer():
 
 
 @pytest.fixture
-def held(service, customer, day):
+def held(service, customer, day, business, request):
+    # The window is snapshotted onto the booking when it is created, so a
+    # test that needs a different policy must set it BEFORE the hold
+    # exists. @pytest.mark.parametrize("held", [N], indirect=True) does.
+    if hasattr(request, "param"):
+        business.free_cancellation_hours = request.param
+        business.save(update_fields=["free_cancellation_hours"])
     start_at = datetime.combine(day, time(10), tzinfo=TZ)
     return holds.create_hold(service=service, customer=customer, start_at=start_at)
 
@@ -86,9 +92,8 @@ def mark_paid(held):
     return held
 
 
-def test_free_cancellation_refunds_the_deposit(business, held):
-    business.free_cancellation_hours = 0
-    business.save()
+@pytest.mark.parametrize("held", [0], indirect=True)
+def test_free_cancellation_refunds_the_deposit(held):
     mark_paid(held)
 
     result = lifecycle.cancel_by_customer(held.booking)
@@ -108,9 +113,8 @@ def test_free_cancellation_refunds_the_deposit(business, held):
     assert not LedgerEntry.objects.filter(entry_type=LedgerEntry.Type.DEPOSIT_FORFEITED).exists()
 
 
-def test_late_cancellation_forfeits_the_deposit(business, held):
-    business.free_cancellation_hours = 216  # 9 days: every fixture slot is "late"
-    business.save()
+@pytest.mark.parametrize("held", [216], indirect=True)  # 9 days: every fixture slot is "late"
+def test_late_cancellation_forfeits_the_deposit(held):
     mark_paid(held)
 
     result = lifecycle.cancel_by_customer(held.booking)
@@ -127,6 +131,19 @@ def test_late_cancellation_forfeits_the_deposit(business, held):
     again = lifecycle.cancel_by_customer(held.booking)
     assert again.forfeited is True
     assert LedgerEntry.objects.filter(entry_type=LedgerEntry.Type.DEPOSIT_FORFEITED).count() == 1
+
+
+def test_policy_edits_do_not_rewrite_existing_bookings(business, held):
+    """The customer keeps the window that was in force when they booked."""
+    business.free_cancellation_hours = 216  # 9 days: would forfeit if read live
+    business.save(update_fields=["free_cancellation_hours"])
+    mark_paid(held)
+
+    result = lifecycle.cancel_by_customer(held.booking)
+
+    assert result.refund is not None
+    assert result.forfeited is False
+    assert held.booking.free_cancellation_hours == 24
 
 
 def test_cancelling_an_unpaid_hold_frees_the_slot(held, service, customer):
@@ -147,9 +164,8 @@ def test_cancelling_an_unpaid_hold_frees_the_slot(held, service, customer):
     assert replacement.booking.status == Booking.Status.PENDING_PAYMENT
 
 
-def test_business_cancellation_refunds_even_late(business, held):
-    business.free_cancellation_hours = 216
-    business.save()
+@pytest.mark.parametrize("held", [216], indirect=True)
+def test_business_cancellation_refunds_even_late(held):
     mark_paid(held)
 
     result = lifecycle.cancel_by_business(held.booking)

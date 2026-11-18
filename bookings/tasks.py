@@ -19,12 +19,14 @@ Concurrency contract, identical to every other seat-touching service:
   re-running the task cannot over-release.
 """
 import logging
+from datetime import timedelta
 
 from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
-from .models import Booking, ClassSession
+from . import payments, paystack, refunds
+from .models import Booking, ClassSession, Payment
 
 logger = logging.getLogger(__name__)
 
@@ -100,3 +102,77 @@ def _expire_hold(booking_id, now) -> bool:
         booking.save()  # save() clears expires_at for non-pending states
 
     return True
+
+
+# --------------------------------------------------------------------------
+# Payment reconciliation
+# --------------------------------------------------------------------------
+@shared_task
+def reconcile_pending_payments(older_than_minutes=10, limit=100) -> int:
+    """Re-verify deposits whose webhook never arrived.
+
+    The webhook is the primary confirmation, but delivery can be delayed
+    or dropped. Every deposit still INITIATED after the grace period is
+    checked with Paystack through the same apply path the webhook uses, so
+    both routes converge on identical state.
+
+    Only terminal provider states are applied; pending/ongoing stays
+    INITIATED for the next tick.
+    """
+    settled = 0
+    for payment_id in payments.pending_deposit_ids(older_than_minutes, limit):
+        try:
+            payment = payments.verify_and_apply(payment_id)
+        except payments.AmountMismatch:
+            # Real money discrepancy: never guess. Ops reconciles manually.
+            logger.error("Amount mismatch while reconciling payment %s", payment_id)
+            continue
+        except payments.PaymentNotFound:
+            logger.warning("Payment %s disappeared during reconciliation", payment_id)
+            continue
+        except paystack.PaystackError as exc:
+            # Provider outage: leave the row alone for the next tick.
+            logger.warning("Could not verify payment %s: %s", payment_id, exc)
+            continue
+
+        if payment.status != Payment.Status.INITIATED:
+            settled += 1
+
+    if settled:
+        logger.info("Reconciled %s pending payment(s)", settled)
+    return settled
+
+
+@shared_task
+def retry_stuck_refunds(older_than_minutes=15, limit=100) -> int:
+    """Re-send refunds that never reached Paystack.
+
+    queue_refund sends on commit; if that HTTP call fails the row stays
+    INITIATED and nothing else retries it. create_refund is idempotent by
+    reference (a reused reference returns the existing refund), so a
+    retry can never double-refund.
+    """
+    cutoff = timezone.now() - timedelta(minutes=older_than_minutes)
+    refund_ids = list(
+        Payment.objects.filter(
+            kind=Payment.Kind.REFUND,
+            status=Payment.Status.INITIATED,
+            created_at__lte=cutoff,
+        )
+        .order_by("created_at")
+        .values_list("pk", flat=True)[:limit]
+    )
+
+    resolved = 0
+    for refund_id in refund_ids:
+        try:
+            refund = refunds.send_refund(refund_id)
+        except refunds.RefundError as exc:
+            logger.warning("Refund %s is still stuck: %s", refund_id, exc)
+            continue
+        if refund.status != Payment.Status.INITIATED:
+            resolved += 1
+
+    if resolved:
+        logger.info("Moved %s stuck refund(s) to a terminal state", resolved)
+    return resolved

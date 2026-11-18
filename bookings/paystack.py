@@ -69,19 +69,32 @@ def _request(method, path, payload=None, timeout=10) -> dict:
     return parsed["data"]
 
 
-def initialize_transaction(*, email, amount_kobo, reference, metadata=None, timeout=10) -> dict:
+def initialize_transaction(
+    *, email, amount_kobo, reference, metadata=None, callback_url=None, timeout=10
+) -> dict:
     """Start a charge. Returns Paystack's data dict (authorization_url etc.)."""
-    return _request(
-        "POST",
-        "/transaction/initialize",
-        {
-            "email": email,
-            "amount": amount_kobo,
-            "reference": reference,
-            "metadata": metadata or {},
-        },
-        timeout=timeout,
-    )
+    payload = {
+        "email": email,
+        "amount": amount_kobo,
+        "reference": reference,
+        "metadata": metadata or {},
+    }
+    if callback_url:
+        # Where Paystack sends the customer after paying. It appends
+        # ?trxref=...&reference=... to this URL.
+        payload["callback_url"] = callback_url
+    return _request("POST", "/transaction/initialize", payload, timeout=timeout)
+
+
+def verify_transaction(reference, timeout=10) -> dict:
+    """Fetch the authoritative state of a charge from Paystack.
+
+    The webhook is the primary signal, but it can be delayed or dropped.
+    The return page and the reconciliation task call this to close that
+    gap. Returns Paystack's `data` dict; `data["status"]` is one of
+    success / failed / abandoned / ongoing / pending / processing / queued.
+    """
+    return _request("GET", f"/transaction/verify/{urllib.parse.quote(reference, safe='')}", timeout=timeout)
 
 
 def create_refund(*, transaction_reference, amount_kobo, reference, timeout=10) -> dict:

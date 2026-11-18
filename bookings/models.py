@@ -60,6 +60,14 @@ class Business(models.Model):
     address = models.CharField(max_length=255, blank=True)
     timezone = models.CharField(max_length=64, default="Africa/Lagos")
 
+    # Public storefront fields, rendered by the customer app. URLs rather
+    # than uploads: no storage backend is required for v1, and an owner can
+    # point at whatever CDN they already use.
+    description = models.TextField(blank=True, default="")
+    phone = models.CharField(max_length=32, blank=True, default="")
+    logo_url = models.URLField(max_length=500, blank=True, default="")
+    brand_color = models.CharField(max_length=7, blank=True, default="")  # #RRGGBB
+
     # Policy anchors — availability, holds and refunds all read from here.
     deposit_percent = models.PositiveSmallIntegerField(default=20)           # 0-100
     free_cancellation_hours = models.PositiveSmallIntegerField(default=24)   # refund window
@@ -78,6 +86,12 @@ class Business(models.Model):
             models.CheckConstraint(
                 condition=Q(deposit_percent__lte=100),
                 name="business_deposit_percent_max_100",
+            ),
+            # Empty, or exactly #RRGGBB. The customer app pastes this into
+            # CSS, so a malformed value must never reach the database.
+            models.CheckConstraint(
+                condition=Q(brand_color="") | Q(brand_color__regex=r"^#[0-9A-Fa-f]{6}$"),
+                name="business_brand_color_hex",
             ),
         ]
 
@@ -255,6 +269,10 @@ class Booking(models.Model):
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.PENDING_PAYMENT)
     price_kobo = models.PositiveIntegerField()      # snapshot at booking time
     deposit_kobo = models.PositiveIntegerField()    # snapshot at booking time
+    # Snapshot too: the customer agreed to the window in force when they
+    # booked, so an owner editing the policy later cannot change it
+    # retroactively for existing bookings.
+    free_cancellation_hours = models.PositiveSmallIntegerField()
     expires_at = models.DateTimeField(null=True, blank=True)  # unpaid hold deadline
 
     cancelled_at = models.DateTimeField(null=True, blank=True)
@@ -303,6 +321,8 @@ class Booking(models.Model):
         self.is_exclusive = self.is_blocker or self.service.capacity == 1
         buffer = timedelta(minutes=self.service.buffer_minutes)
         self.time_range = TimestamptzRange(self.start_at, self.end_at + buffer)  # default bounds [)
+        if self.free_cancellation_hours is None:  # snapshot once, at creation
+            self.free_cancellation_hours = self.business.free_cancellation_hours
         if self.status == self.Status.PENDING_PAYMENT:
             if not self.expires_at:  # set once, at hold creation
                 self.expires_at = timezone.now() + timedelta(minutes=self.business.hold_minutes)

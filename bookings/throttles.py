@@ -44,3 +44,21 @@ class WebhookThrottle(SimpleRateThrottle):
         # Always the IP: there is no user on this route, and "None" must
         # never be the key (that would share one global bucket per worker).
         return self.cache_format % {"scope": self.scope, "ident": self.get_ident(request)}
+
+
+class PaymentVerifyThrottle(SimpleRateThrottle):
+    """Per-user cap on payment verification.
+
+    The return page may poll, and every poll while the payment is still
+    INITIATED is a Paystack HTTP call. This keeps that budget bounded
+    without blocking the (free) booking read.
+    """
+
+    scope = "payment_verify"
+
+    def get_cache_key(self, request, view):
+        if request.user and request.user.is_authenticated:
+            ident = request.user.pk
+        else:
+            ident = self.get_ident(request)
+        return self.cache_format % {"scope": self.scope, "ident": ident}

@@ -11,8 +11,8 @@ Pipeline:
    processed_at and returns.
 
 Handlers own the financial state transitions. They use the shared lock
-order booking -> payment, and the ledger helpers are idempotent, so a
-retry after a crash cannot double-credit.
+order (session -> booking -> payment), and the ledger helpers are
+idempotent, so a retry after a crash cannot double-credit.
 
 Failure policy:
 - RetryableWebhookError (e.g. payment row not visible yet) leaves the
@@ -32,9 +32,9 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from . import ledger, refunds
-from .constraints import is_exclusion_violation, violated_constraint
-from .models import Booking, ClassSession, Payment, WebhookEvent
+from . import payments, refunds
+from .constraints import violated_constraint
+from .models import Payment, WebhookEvent
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +209,7 @@ def _set_error(event, message):
 
 
 # --------------------------------------------------------------------------
-# Charge handlers
+# Charge handlers — thin wrappers over payments' single apply path
 # --------------------------------------------------------------------------
 def _handle_charge_success(event):
     data = event.payload.get("data") or {}
@@ -218,24 +218,13 @@ def _handle_charge_success(event):
         raise PermanentWebhookError("charge.success has no reference.")
 
     booking, payment = _lock_deposit(reference)
-    if payment.status == Payment.Status.SUCCESS:
-        return  # already applied; ledger is idempotent too
     if data.get("status") != "success":
         raise PermanentWebhookError("charge.success payload is not successful.")
 
-    amount = _amount(data)
-    if amount != payment.amount_kobo:
-        raise PermanentWebhookError(
-            f"Amount mismatch for {reference}: expected {payment.amount_kobo}, got {amount}."
-        )
-
-    payment.status = Payment.Status.SUCCESS
-    payment.paid_at = timezone.now()
-    payment.paystack_response = data
-    payment.save(update_fields=["status", "paid_at", "paystack_response"])
-
-    ledger.credit_deposit(payment, booking)
-    _confirm_or_refund(booking, payment)
+    try:
+        payments.apply_charge_success(booking, payment, data)
+    except payments.AmountMismatch as exc:
+        raise PermanentWebhookError(f"Amount mismatch for {reference}: {exc}") from exc
 
 
 def _handle_charge_failed(event):
@@ -245,96 +234,16 @@ def _handle_charge_failed(event):
         raise PermanentWebhookError("charge.failed has no reference.")
 
     booking, payment = _lock_deposit(reference)
-    if payment.status in (Payment.Status.SUCCESS, Payment.Status.REFUNDED):
-        return  # a late failure never undoes a successful charge
-
-    payment.status = Payment.Status.FAILED
-    payment.paystack_response = data
-    payment.save(update_fields=["status", "paystack_response"])
-
-    if booking.status == Booking.Status.PENDING_PAYMENT:
-        booking.status = Booking.Status.EXPIRED
-        booking.save()
-        if booking.session_id:
-            ClassSession.release_seats(booking.session_id, booking.party_size)
+    payments.mark_charge_failed(booking, payment, data)
 
 
 def _lock_deposit(reference):
-    """Lock booking first, then its deposit payment (global lock order)."""
-    snapshot = Payment.objects.filter(
-        reference=reference, kind=Payment.Kind.DEPOSIT
-    ).values("id", "booking_id").first()
-    if snapshot is None:
-        raise RetryableWebhookError(f"No deposit payment for reference {reference}.")
-
-    # Session first for group bookings: lifecycle's cancel_session holds
-    # the session lock while cancelling its bookings, and both must use
-    # the same order or the two paths can deadlock.
-    session_id = Booking.objects.values_list("session_id", flat=True).get(pk=snapshot["booking_id"])
-    if session_id is not None:
-        ClassSession.objects.select_for_update().get(pk=session_id)
-
-    booking = Booking.objects.select_for_update().get(pk=snapshot["booking_id"])
-    payment = Payment.objects.select_for_update().get(pk=snapshot["id"])
-    return booking, payment
-
-
-def _confirm_or_refund(booking, payment):
-    now = timezone.now()
-
-    if booking.status == Booking.Status.CONFIRMED:
-        return
-
-    if booking.status == Booking.Status.PENDING_PAYMENT:
-        if booking.start_at <= now:
-            _queue_refund(booking)
-            return
-        booking.status = Booking.Status.CONFIRMED
-        booking.save()
-        return
-
-    if booking.status == Booking.Status.EXPIRED:
-        if booking.start_at <= now:
-            _queue_refund(booking)
-            return
-        if _restore_expired(booking):
-            return
-        _queue_refund(booking)
-        return
-
-    # Cancelled, no-show, completed: money arrived for a booking that is
-    # no longer deliverable, so give it back.
-    _queue_refund(booking)
-
-
-def _restore_expired(booking) -> bool:
-    """Try to turn an expired hold back into a confirmed booking.
-
-    Group seats were released on expiry, so they must be reserved again;
-    one-to-one bookings rely on the exclusion constraint to reject the
-    restore when the slot has since been taken. The savepoint makes
-    either failure leave no partial state.
-    """
+    """Webhook-specific translation of the shared lock helper."""
     try:
-        with transaction.atomic():
-            if booking.session_id:
-                if not ClassSession.reserve_seats(booking.session_id, booking.party_size):
-                    return False
-            booking.status = Booking.Status.CONFIRMED
-            booking.save()
-        return True
-    except IntegrityError as exc:
-        if is_exclusion_violation(exc):
-            return False
-        raise
-
-
-def _queue_refund(booking):
-    """Create the refund row and send it after the webhook transaction commits."""
-    try:
-        refunds.queue_refund(booking)
-    except refunds.RefundError as exc:
-        raise PermanentWebhookError(f"Refund could not be created: {exc}") from exc
+        return payments.lock_deposit_by_reference(reference)
+    except payments.PaymentNotFound as exc:
+        # Retryable: the deposit row may not be visible yet.
+        raise RetryableWebhookError(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------

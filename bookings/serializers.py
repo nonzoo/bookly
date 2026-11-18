@@ -12,7 +12,8 @@ must not change when the owner edits the menu.
 """
 from rest_framework import serializers
 
-from .models import Booking, ClassSession, Resource, Service
+from . import money
+from .models import Booking, Business, ClassSession, Resource, Service
 
 
 class AvailabilityQuerySerializer(serializers.Serializer):
@@ -38,16 +39,88 @@ class HoldCreateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, default="", max_length=500)
 
 
+class PublicResourceSerializer(serializers.ModelSerializer):
+    """Who/what the customer can pick ("any barber", or Ada specifically)."""
+
+    class Meta:
+        model = Resource
+        fields = ("id", "name", "kind")
+        read_only_fields = fields
+
+
+class PublicServiceSerializer(serializers.ModelSerializer):
+    """A menu item on the public storefront.
+
+    price_kobo and deposit_kobo are PER HEAD for group services
+    (capacity > 1), exactly as money.py computes them; is_group tells the
+    frontend which convention to display. The serializer never invents
+    totals — checkout always re-prices server-side from the same helpers.
+    """
+
+    deposit_kobo = serializers.SerializerMethodField()
+    is_group = serializers.BooleanField(read_only=True)
+    resources = PublicResourceSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Service
+        fields = (
+            "id",
+            "name",
+            "duration_minutes",
+            "buffer_minutes",
+            "price_kobo",
+            "deposit_kobo",
+            "capacity",
+            "is_group",
+            "requires_address",
+            "resources",
+        )
+        read_only_fields = fields
+
+    def get_deposit_kobo(self, service):
+        # One head is the unit the storefront quotes. The real deposit is
+        # recomputed from party_size when the hold is created.
+        return money.deposit_kobo(service, 1)
+
+
+class PublicBusinessSerializer(serializers.ModelSerializer):
+    """The customer-facing storefront: branding, policy and open services."""
+
+    services = PublicServiceSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Business
+        fields = (
+            "id",
+            "name",
+            "slug",
+            "category",
+            "address",
+            "timezone",
+            "description",
+            "phone",
+            "logo_url",
+            "brand_color",
+            "deposit_percent",
+            "free_cancellation_hours",
+            "hold_minutes",
+            "services",
+        )
+        read_only_fields = fields
+
+
 class BookingSerializer(serializers.ModelSerializer):
     service_name = serializers.CharField(source="service.name", read_only=True)
     resource_name = serializers.CharField(source="resource.name", read_only=True)
     business_name = serializers.CharField(source="business.name", read_only=True)
+    business_slug = serializers.CharField(source="business.slug", read_only=True)
 
     class Meta:
         model = Booking
         fields = (
             "id",
             "business_name",
+            "business_slug",
             "service_name",
             "resource_name",
             "session",
@@ -55,6 +128,8 @@ class BookingSerializer(serializers.ModelSerializer):
             "end_at",
             "party_size",
             "status",
+            # The snapshot the customer agreed to — not next week's policy.
+            "free_cancellation_hours",
             "price_kobo",
             "deposit_kobo",
             "expires_at",

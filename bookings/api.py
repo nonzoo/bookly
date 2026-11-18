@@ -2,9 +2,14 @@
 
 Every view is a thin adapter: authenticate (JWT, global default), validate
 shape via a serializer, call ONE service function, translate domain
-exceptions to HTTP. No business rules live here — holds, lifecycle and
-availability already own them for the webhook and admin paths too, and
-duplicating a rule in a view is how the two copies start disagreeing.
+exceptions to HTTP. No business rules live here — holds, lifecycle,
+payments and availability already own them for the webhook and admin paths
+too, and duplicating a rule in a view is how the two copies start
+disagreeing.
+
+Public (AllowAny) routes are read-only discovery: the storefront catalog
+and slot availability. Creating a booking, reading it and verifying its
+payment all require the owning account.
 
 HTTP mapping (consistent across endpoints):
 - unauthenticated                    401 (DRF default)
@@ -13,25 +18,64 @@ HTTP mapping (consistent across endpoints):
 - SlotTaken / SessionFull            409 (real conflict; pick another time)
 - PaymentInitiationFailed            502 (upstream provider failed)
 - InvalidTransition                  409 (wrong state for the action)
+- AmountMismatch on verify           409 (provider paid amount differs)
+- Paystack verify failure            502 (upstream provider failed)
 - not found / not yours              404 (no existence leak)
 """
+import logging
+
+from django.db.models import Prefetch
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.decorators import api_view, throttle_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
-from . import availability, holds, lifecycle
-from .models import Booking, Service
-from .serializers import AvailabilityQuerySerializer, BookingSerializer, HoldCreateSerializer
-from .throttles import BookingCreateThrottle
+from . import availability, holds, lifecycle, payments, paystack
+from .models import Booking, Business, Payment, Service
+from .serializers import (
+    AvailabilityQuerySerializer,
+    BookingSerializer,
+    HoldCreateSerializer,
+    PublicBusinessSerializer,
+)
+from .throttles import BookingCreateThrottle, PaymentVerifyThrottle
+
+logger = logging.getLogger(__name__)
 
 
 @api_view(["GET"])
+@permission_classes([AllowAny])
+def business_detail(request, slug):
+    """Public storefront: branding, policy and the active service menu.
+
+    Inactive services are filtered in the prefetch, so rendering the menu
+    costs one extra query instead of one per service.
+    """
+    business = get_object_or_404(
+        Business.objects.prefetch_related(
+            Prefetch(
+                "services",
+                queryset=Service.objects.filter(is_active=True)
+                .select_related("business")
+                .prefetch_related("resources")
+                .order_by("name", "id"),
+            )
+        ),
+        slug=slug,
+    )
+    return Response(PublicBusinessSerializer(business).data)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
 def service_availability(request, service_id):
     """Advisory slots (one-to-one) or sessions with seats left (group).
 
-    The response can be stale the instant it is rendered; the create
-    endpoint is where the database has the final word.
+    Public on purpose: a customer must be able to see times before being
+    asked to create an account. The response can be stale the instant it
+    is rendered; the create endpoint is where the database has the final
+    word.
     """
     service = get_object_or_404(
         Service.objects.select_related("business"), pk=service_id, is_active=True
@@ -48,6 +92,7 @@ def service_availability(request, service_id):
         service, day, resource_id=query.validated_data.get("resource")
     )
     return Response({"mode": "slots", "slots": slots})
+
 
 
 @api_view(["GET", "POST"])
@@ -134,5 +179,88 @@ def cancel_booking(request, booking_id):
             "booking": BookingSerializer(result.booking).data,
             "refund_status": result.refund.status if result.refund else None,
             "forfeited": result.forfeited,
+        }
+    )
+
+
+@api_view(["GET"])
+def booking_detail(request, booking_id):
+    """One booking, for the owner only.
+
+    The payment-return page polls this (or verify_payment) until the
+    webhook settles the state. Someone else's booking is a 404, not a
+    403: the API never confirms that an id exists.
+    """
+    booking = (
+        Booking.objects.filter(pk=booking_id, customer=request.user, is_blocker=False)
+        .select_related("business", "service", "resource")
+        .first()
+    )
+    if booking is None:
+        return Response({"detail": "Booking not found."}, status=status.HTTP_404_NOT_FOUND)
+    return Response(BookingSerializer(booking).data)
+
+
+@api_view(["POST"])
+@throttle_classes([PaymentVerifyThrottle])
+def verify_payment(request):
+    """Ask Paystack for the authoritative state of a deposit, then apply it.
+
+    This is the recovery path for a delayed or dropped webhook: the
+    customer's return page calls it, and the reconciliation task uses the
+    same underlying service. It is safe to poll — once the payment is no
+    longer INITIATED the provider is not called again, so a payment can
+    never be applied twice.
+    """
+    reference = request.data.get("reference")
+    if not isinstance(reference, str) or not reference.strip():
+        return Response(
+            {"detail": "A payment reference is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    reference = reference.strip()
+
+    payment = (
+        Payment.objects.filter(
+            reference=reference,
+            kind=Payment.Kind.DEPOSIT,
+            booking__customer=request.user,
+        )
+        .select_related("booking")
+        .first()
+    )
+    if payment is None:
+        return Response({"detail": "Payment not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    if payment.status == Payment.Status.INITIATED:
+        try:
+            payment = payments.verify_and_apply(payment.pk)
+        except payments.PaymentNotFound:
+            return Response(
+                {"detail": "Payment not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        except paystack.PaystackError as exc:
+            return Response(
+                {"detail": f"Paystack could not verify the payment: {exc}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except payments.AmountMismatch as exc:
+            # Real money discrepancy: the booking stays untouched and ops
+            # has to look at it. The customer sees a conflict, not a 500.
+            logger.error("Amount mismatch verifying %s: %s", reference, exc)
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+
+    booking = Booking.objects.select_related(
+        "business", "service", "resource"
+    ).get(pk=payment.booking_id)
+    return Response(
+        {
+            "payment": {
+                "reference": payment.reference,
+                "status": payment.status,
+                "amount_kobo": payment.amount_kobo,
+                "paid_at": payment.paid_at,
+            },
+            "booking": BookingSerializer(booking).data,
         }
     )

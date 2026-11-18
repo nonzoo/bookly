@@ -20,8 +20,8 @@ from django.conf import settings
 from django.db import connection, transaction
 from django.utils import timezone
 
-from bookings import holds, sessions, tasks
-from bookings.models import Booking, ClassSession
+from bookings import holds, ledger, paystack, refunds, sessions, tasks
+from bookings.models import Booking, ClassSession, LedgerEntry, Payment
 from bookings.tests.factories import (
     future_weekday,
     make_business,
@@ -219,6 +219,161 @@ def test_sweep_skips_a_booking_locked_elsewhere(service, customer, day):
 def test_beat_schedule_points_at_the_registered_task():
     from config.celery import app as celery_app
 
-    entry = settings.CELERY_BEAT_SCHEDULE["expire-overdue-holds"]
-    assert entry["task"] == "bookings.tasks.expire_overdue_holds"
-    assert entry["task"] in celery_app.tasks
+    for name in (
+        "expire-overdue-holds",
+        "reconcile-pending-payments",
+        "retry-stuck-refunds",
+    ):
+        entry = settings.CELERY_BEAT_SCHEDULE[name]
+        assert entry["task"] in celery_app.tasks
+
+
+# --------------------------------------------------------------------------
+# Payment reconciliation
+# --------------------------------------------------------------------------
+@pytest.fixture
+def provider_verify(monkeypatch):
+    calls = []
+
+    def fake_verify(reference, timeout=10):
+        calls.append(reference)
+        if fake_verify.error is not None:
+            raise fake_verify.error
+        return fake_verify.response
+
+    fake_verify.calls = calls
+    fake_verify.response = {"status": "pending"}
+    fake_verify.error = None
+    monkeypatch.setattr("bookings.paystack.verify_transaction", fake_verify)
+    return fake_verify
+
+
+def age_payment(payment, minutes=11):
+    """Push created_at past the reconciliation grace period."""
+    Payment.objects.filter(pk=payment.pk).update(
+        created_at=timezone.now() - timedelta(minutes=minutes)
+    )
+
+
+def test_reconcile_confirms_a_paid_booking_whose_webhook_was_dropped(
+    service, customer, day, provider_verify
+):
+    held = holds.create_hold(
+        service=service,
+        customer=customer,
+        start_at=datetime.combine(day, time(10), tzinfo=TZ),
+    )
+    age_payment(held.payment)
+    provider_verify.response = {"status": "success", "amount": held.payment.amount_kobo}
+
+    assert tasks.reconcile_pending_payments() == 1
+
+    held.payment.refresh_from_db()
+    held.booking.refresh_from_db()
+    assert held.payment.status == Payment.Status.SUCCESS
+    assert held.booking.status == Booking.Status.CONFIRMED
+    assert LedgerEntry.objects.filter(
+        payment=held.payment, entry_type=LedgerEntry.Type.DEPOSIT_RECEIVED
+    ).exists()
+    assert provider_verify.calls == [held.payment.reference]
+
+
+def test_reconcile_skips_payments_inside_the_grace_period(
+    service, customer, day, provider_verify
+):
+    holds.create_hold(
+        service=service,
+        customer=customer,
+        start_at=datetime.combine(day, time(10), tzinfo=TZ),
+    )
+
+    assert tasks.reconcile_pending_payments() == 0
+    assert provider_verify.calls == []
+
+
+def test_reconcile_leaves_pending_charges_for_the_next_tick(
+    service, customer, day, provider_verify
+):
+    held = holds.create_hold(
+        service=service,
+        customer=customer,
+        start_at=datetime.combine(day, time(10), tzinfo=TZ),
+    )
+    age_payment(held.payment)
+    provider_verify.response = {"status": "ongoing"}
+
+    assert tasks.reconcile_pending_payments() == 0
+
+    held.payment.refresh_from_db()
+    assert held.payment.status == Payment.Status.INITIATED
+    held.booking.refresh_from_db()
+    assert held.booking.status == Booking.Status.PENDING_PAYMENT
+
+
+def test_reconcile_survives_a_provider_outage(service, customer, day, provider_verify):
+    held = holds.create_hold(
+        service=service,
+        customer=customer,
+        start_at=datetime.combine(day, time(10), tzinfo=TZ),
+    )
+    age_payment(held.payment)
+    provider_verify.error = paystack.PaystackError("provider down")
+
+    assert tasks.reconcile_pending_payments() == 0
+
+    held.payment.refresh_from_db()
+    assert held.payment.status == Payment.Status.INITIATED
+
+
+# --------------------------------------------------------------------------
+# Refund retry
+# --------------------------------------------------------------------------
+def queue_refund_for(held):
+    """Turn a deposit SUCCESS, then create the refund row (unsent in tests)."""
+    Payment.objects.filter(pk=held.payment.pk).update(status=Payment.Status.SUCCESS)
+    held.payment.refresh_from_db()
+    held.booking.status = Booking.Status.CONFIRMED
+    held.booking.save()
+    ledger.credit_deposit(held.payment, held.booking)
+    return refunds.queue_refund(held.booking)
+
+
+def test_retry_stuck_refunds_finishes_an_initiated_refund(
+    service, customer, day, monkeypatch
+):
+    held = holds.create_hold(
+        service=service,
+        customer=customer,
+        start_at=datetime.combine(day, time(10), tzinfo=TZ),
+    )
+    refund = queue_refund_for(held)
+    age_payment(refund, minutes=60)
+
+    monkeypatch.setattr(
+        "bookings.paystack.create_refund",
+        lambda **kwargs: {"status": "processed", "reference": kwargs["reference"]},
+    )
+
+    assert tasks.retry_stuck_refunds() == 1
+
+    refund.refresh_from_db()
+    held.payment.refresh_from_db()
+    assert refund.status == Payment.Status.SUCCESS
+    assert held.payment.status == Payment.Status.REFUNDED
+    assert LedgerEntry.objects.filter(
+        payment=refund, entry_type=LedgerEntry.Type.REFUND
+    ).exists()
+
+
+def test_retry_stuck_refunds_skips_recent_rows(service, customer, day):
+    held = holds.create_hold(
+        service=service,
+        customer=customer,
+        start_at=datetime.combine(day, time(10), tzinfo=TZ),
+    )
+    refund = queue_refund_for(held)
+
+    assert tasks.retry_stuck_refunds() == 0
+
+    refund.refresh_from_db()
+    assert refund.status == Payment.Status.INITIATED
